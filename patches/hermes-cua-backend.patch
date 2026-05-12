@@ -1,0 +1,189 @@
+diff --git a/tools/computer_use/cua_backend.py b/tools/computer_use/cua_backend.py
+index df1162c5d..583d5a141 100644
+--- a/tools/computer_use/cua_backend.py
++++ b/tools/computer_use/cua_backend.py
+@@ -28,6 +28,7 @@ import shutil
+ import subprocess
+ import sys
+ import threading
++import time
+ from concurrent.futures import Future
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+@@ -307,29 +308,170 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
+     return {"data": data, "images": images, "structuredContent": structured, "isError": is_error}
+ 
+ 
++# ---------------------------------------------------------------------------
++# CLI subprocess session — calls `cua-driver call` per tool invocation
++# ---------------------------------------------------------------------------
++
++def _normalize_cli_response(raw: Dict[str, Any]) -> Dict[str, Any]:
++    """Convert the MCP CallToolResult from `cua-driver call --raw` into
++    the same dict format as _extract_tool_result.
++
++    Returns: {"data": ..., "images": [...], "structuredContent": ..., "isError": bool}
++    """
++    images: List[str] = []
++    text_chunks: List[str] = []
++    is_error = bool(raw.get("isError", False))
++    structured = raw.get("structuredContent")
++
++    for part in raw.get("content", []) or []:
++        ptype = part.get("type", "") if isinstance(part, dict) else getattr(part, "type", "")
++        if ptype == "text":
++            text = part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "") or ""
++            text_chunks.append(text)
++        elif ptype == "image":
++            b64 = part.get("data", "") if isinstance(part, dict) else getattr(part, "data", "") or ""
++            if b64:
++                images.append(b64)
++
++    data: Any = None
++    if text_chunks:
++        joined = "\n".join(t for t in text_chunks if t)
++        try:
++            data = json.loads(joined) if joined.strip().startswith(("{", "[")) else joined
++        except json.JSONDecodeError:
++            data = joined
++    elif structured:
++        data = structured
++
++    return {
++        "data": data,
++        "images": images,
++        "structuredContent": structured,
++        "isError": is_error,
++    }
++
++
++class _CliCallSession:
++    """Invokes `cua-driver call` per tool call.
++
++    Delegates to the cua-driver CLI which handles daemon lifecycle and
++    argument serialization correctly — avoids raw socket protocol issues.
++    Each call spawns a short-lived subprocess (~200ms overhead).
++    """
++
++    def __init__(self) -> None:
++        self._started = False
++
++    def start(self) -> None:
++        self._started = True
++
++    def stop(self) -> None:
++        self._started = False
++
++    def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
++        if not self._started:
++            raise RuntimeError("cua-driver CLI session not started")
++
++        driver_cmd = _CUA_DRIVER_CMD
++        args_json = json.dumps(args)
++
++        try:
++            proc = subprocess.run(
++                [driver_cmd, "call", name, args_json, "--raw", "--compact"],
++                capture_output=True,
++                timeout=timeout,
++            )
++        except FileNotFoundError:
++            raise RuntimeError(cua_driver_install_hint())
++        except subprocess.TimeoutExpired:
++            raise RuntimeError(
++                f"cua-driver call {name} timed out after {timeout}s"
++            )
++
++        if proc.returncode != 0:
++            stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
++            stdout = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
++            msg = stderr or stdout or f"exit code {proc.returncode}"
++            return {
++                "data": msg,
++                "images": [],
++                "structuredContent": None,
++                "isError": True,
++            }
++
++        raw_text = proc.stdout.decode("utf-8", errors="replace").strip()
++        if not raw_text:
++            return {
++                "data": "empty response",
++                "images": [],
++                "structuredContent": None,
++                "isError": True,
++            }
++
++        try:
++            parsed = json.loads(raw_text)
++        except json.JSONDecodeError:
++            return {
++                "data": raw_text,
++                "images": [],
++                "structuredContent": None,
++                "isError": False,
++            }
++
++        # If the response is a plain dict (not MCP envelope), wrap it
++        if "content" not in parsed and "structuredContent" not in parsed:
++            return {
++                "data": parsed,
++                "images": [],
++                "structuredContent": parsed,
++                "isError": False,
++            }
++
++        return _normalize_cli_response(parsed)
++
++
+ # ---------------------------------------------------------------------------
+ # The backend itself
+ # ---------------------------------------------------------------------------
+ 
+ class CuaDriverBackend(ComputerUseBackend):
+-    """Default computer-use backend. macOS-only via cua-driver MCP."""
++    """Default computer-use backend. macOS-only via cua-driver daemon socket.
+ 
+-    def __init__(self) -> None:
+-        self._bridge = _AsyncBridge()
+-        self._session = _CuaDriverSession(self._bridge)
++    Uses the persistent `cua-driver serve` daemon over a Unix socket instead
++    of the MCP stdio transport. This avoids both the TCC entitlement gap and
++    the Swift concurrency + AppKit deadlock on Intel — the daemon path never
++    calls PermissionsGate or AppKitBootstrap.
++
++    Falls back to the daemon call subprocess if the socket is unavailable.
++    """
++
++    def __init__(self, prefer_mcp: bool = False) -> None:
++        # MCP session (requires async bridge) — use only if explicitly requested
++        # for arm64 compatibility. Default is daemon socket which works everywhere.
++        self._use_mcp = prefer_mcp
++        self._bridge: Optional[_AsyncBridge] = None
++        self._session: Any = None  # _CliCallSession or _CuaDriverSession
+         # Sticky context — updated by capture(), used by action tools.
+         self._active_pid: Optional[int] = None
+         self._active_window_id: Optional[int] = None
+ 
+     # ── Lifecycle ──────────────────────────────────────────────────
+     def start(self) -> None:
++        if self._use_mcp:
++            self._bridge = _AsyncBridge()
++            self._session = _CuaDriverSession(self._bridge)
++        else:
++            self._session = _CliCallSession()
+         self._session.start()
+ 
+     def stop(self) -> None:
+         try:
+-            self._session.stop()
++            if self._session is not None:
++                self._session.stop()
+         finally:
+-            self._bridge.stop()
++            if self._bridge is not None:
++                self._bridge.stop()
++                self._bridge = None
+ 
+     def is_available(self) -> bool:
+         if not _is_macos():
