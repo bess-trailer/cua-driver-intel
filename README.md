@@ -115,6 +115,7 @@ The **CLI subprocess path** is the recommended approach. Each tool call runs `cu
 | [Setup](docs/02-SETUP.md) | Step-by-step: binary → bundle → Hermes backend → verification |
 | [Capabilities](docs/03-CAPABILITIES.md) | Tool matrix — what works per transport mode |
 | [Troubleshooting](docs/04-TROUBLESHOOTING.md) | Symptom → cause → fix table |
+| [Test Report](docs/05-TESTED.md) | What we actually ran — every tool, mode, and parameter tested with results |
 | [Upgrading](docs/05-UPGRADING.md) | Replacing the binary, testing a new build |
 | [Contributing](docs/06-CONTRIBUTING.md) | Reproducing the deadlock, testing a potential fix |
 
