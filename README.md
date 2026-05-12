@@ -37,6 +37,28 @@ Your Mac:
 | Screenshots (vision mode) | ✅ Work via bundle daemon (TCC satisfied by code-signing) |
 | Raw socket protocol | 🟡 Works for zero-arg tools; pid serialization bug for argument tools |
 
+## ⚠️ Environment Caveats — Read This First
+
+**This workaround was built and tested on one specific machine:**
+
+| Property | Value |
+|----------|-------|
+| Model | iMac14,3 (late 2013) |
+| CPU | Intel Core i5 (4-core, 4-thread) |
+| RAM | 16 GB DDR3 |
+| macOS | 15.7.5 (Sequoia) |
+| cua-driver | v0.1.5 custom x86_64 build (PR #1469) |
+| Hermes Agent | Upstream main (May 2026) |
+
+Your mileage will vary depending on:
+
+- **macOS version** — TCC behavior, SkyLight SPI availability, and code signing requirements change between versions. macOS 14 (Sonoma) and 15 (Sequoia) are most likely to work the same. Older versions (macOS 13 Ventura, 12 Monterey) may have different SkyLight symbol names or missing permissions APIs.
+- **CPU generation** — The Swift concurrency cooperative thread pool deadlock is most likely on **4-core/4-thread** CPUs (Haswell and earlier). Newer Intel CPUs with Hyper-Threading (6+ threads) or efficiency cores *may* avoid the starvation condition. The exact threshold is unknown — we tested on exactly one machine.
+- **Swift runtime version** — The Swift 6 runtime changed the cooperative thread pool behavior. If cua-driver is recompiled with a different Swift version, the deadlock may manifest differently or not at all.
+- **Code signing requirements** — macOS 15.2+ requires hardened runtime for some entitlements. Ad-hoc signing (which `create-bundle.sh` uses) may not satisfy all TCC gates on newer macOS builds.
+
+**If the workaround doesn't work on your machine:** run `bash scripts/diagnose.sh` and open an issue with the output. The more data points we have, the better the coverage.
+
 ## Quickstart (4 commands)
 
 ```bash

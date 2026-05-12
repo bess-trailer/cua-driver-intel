@@ -40,6 +40,8 @@ This is the intended upstream mode. The binary runs a stdio MCP server using App
 5. The cooperative thread pool on 4-core Intel doesn't have an available thread to service the `@MainActor` hop
 6. Result: **cooperative pool starvation deadlock** — the Task waits forever, no bytes are written to stdout, the MCP client sees a timeout
 
+> ⚠️ **This deadlock was reproduced and diagnosed on one machine: iMac14,3 (2013), 4-core Core i5, macOS 15.7.5.** The Swift concurrency cooperative thread pool starvation depends on thread count, CPU generation, and Swift runtime version. Machines with more logical cores, Hyper-Threading, or different macOS versions may not reproduce this issue. If `cua-driver mcp` works on your Intel Mac, the deadlock doesn't apply — use the standard upstream path.
+
 **TCC note:** Even if the concurrency bug were fixed, the standalone binary lacks an app bundle with entitlements, so Screen Recording permission would be denied — `SCShareableContent.excludingDesktopWindows()` would return empty.
 
 ### 2. Daemon socket (`cua-driver serve` + raw JSON-RPC) — FASTER BUT BUGGY

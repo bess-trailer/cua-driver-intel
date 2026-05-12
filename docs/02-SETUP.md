@@ -8,6 +8,8 @@ A step-by-step guide from nothing to a working `computer_use` toolset on an Inte
 - An x86_64 `cua-driver` binary (v0.1.5+)
 - System permissions granted (see Phase 4)
 
+> ⚠️ **Tested on one machine:** iMac14,3 (late 2013), 4-core Core i5, macOS 15.7.5, cua-driver v0.1.5. See README.md for the full environment caveats — your macOS version, CPU generation, and Swift runtime may produce different results.
+
 ## Phase 1: Obtain the Binary
 
 Upstream cua-driver only ships arm64 binaries. For Intel, you need a custom x86_64 build.
