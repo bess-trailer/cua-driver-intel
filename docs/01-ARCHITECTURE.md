@@ -1,123 +1,73 @@
-# Architecture — cua-driver on Intel x86_64
+# Architecture
+
+Three transport modes. One works on Intel. This is why.
 
 ## The Stack
 
 ```
-macOS Desktop (SkyLight SPIs + Accessibility APIs)
-  ▲
+Agent (Hermes / Codex / MCP client)
   │
-cua-driver binary (x86_64 custom build v0.1.5+)
-  ▲
-  │
-┌────────────────────────────────────────────────────────────┐
-│                     Transport Layer                        │
-├────────────────┬──────────────────────┬────────────────────┤
-│  MCP stdio     │   Daemon Socket      │   CLI subprocess   │
-│  cua-driver mcp│   cua-driver serve   │   cua-driver call  │
-│  ▲             │   + raw JSON-RPC     │   (recommended)    │
-│  │             │                      │                    │
-│ ❌ DEADLOCK    │ 🟡 pid serialization  │ ✅ Works always    │
-│   on Intel     │    bug on arg tools   │   200ms overhead   │
-└────────────────┴──────────────────────┴────────────────────┘
-  ▲
-  │
-Hermes Agent / Codex / MCP client
+  ├── MCP stdio (cua-driver mcp)           ❌ deadlock on 4-core Intel
+  ├── Daemon socket (raw JSON-RPC)          🟡 pid serialization bug
+  └── CLI subprocess (cua-driver call)      ✅ recommended
+        └── daemon socket ←→ cua-driver serve
+              └── SkyLight SPIs + Accessibility APIs
 ```
 
-## The Three Transport Modes
+## 1. MCP stdio — Upstream path, deadlocked on Intel
 
-### 1. MCP stdio (`cua-driver mcp`) — THE NORMAL PATH (broken on Intel)
+`cua-driver mcp` starts `NSApplication.shared.run()` on the main thread via `AppKitBootstrap`, then spawns a detached Swift concurrency Task to call `PermissionsGate.shared.ensureGranted()`. On 4-core/4-thread Intel:
 
-This is the intended upstream mode. The binary runs a stdio MCP server using Apple's open-source [Swift MCP SDK](https://github.com/modelcontextprotocol/swift-sdk) (v0.9.0+). An MCP client (Hermes Agent, any MCP-compatible tool) spawns the process and communicates via stdin/stdout JSON-RPC following the MCP protocol.
+1. Main thread blocked in `NSApp.run()` — this IS the `@MainActor` executor
+2. Detached Task calls `SCShareableContent.excludingDesktopWindows()` — needs `@MainActor` hop
+3. No cooperative thread available to service the hop → ∞ await
+4. `StdioTransport` never initializes → zero bytes on stdout → MCP client times out at 15s
 
-**On Apple Silicon:** Works perfectly. The MCP SDK's `StdioTransport` initializes, `AppKitBootstrap.shared.ensureGranted()` completes, and tools respond.
+**Upstream fix would require** either: (a) headless MCP mode that skips `AppKitBootstrap` when stdin is a pipe, or (b) moving TCC probe off the concurrency thread pool into a dedicated thread.
 
-**On Intel (iMac14,3, 4-core Core i5):** The process hangs silently:
-1. `AppKitBootstrap` starts `NSApplication.shared.run()` on the main thread
-2. It spawns a detached Swift concurrency Task to call `ensureGranted()`
-3. The Task needs to cross `@MainActor` to interact with AppKit's permission prompts
-4. The main thread is blocked in `NSApplication.shared.run()`, which IS the `@MainActor` executor
-5. The cooperative thread pool on 4-core Intel doesn't have an available thread to service the `@MainActor` hop
-6. Result: **cooperative pool starvation deadlock** — the Task waits forever, no bytes are written to stdout, the MCP client sees a timeout
+> ⚠️ Reproduced on iMac14,3 (4-core Core i5, macOS 15.7.5). May not apply to Intel Macs with >4 threads or different Swift runtime.
 
-> ⚠️ **This deadlock was reproduced and diagnosed on one machine: iMac14,3 (2013), 4-core Core i5, macOS 15.7.5.** The Swift concurrency cooperative thread pool starvation depends on thread count, CPU generation, and Swift runtime version. Machines with more logical cores, Hyper-Threading, or different macOS versions may not reproduce this issue. If `cua-driver mcp` works on your Intel Mac, the deadlock doesn't apply — use the standard upstream path.
+**Bundle effect on MCP:** Wrapping the binary in CuaDriver.app (with ad-hoc signing) lets `ensureGranted()` clear the TCC gate — the process exits cleanly on `/dev/null` stdin. The concurrency deadlock on real MCP handshake persists regardless.
 
-**TCC note:** Even if the concurrency bug were fixed, the standalone binary lacks an app bundle with entitlements, so Screen Recording permission would be denied — `SCShareableContent.excludingDesktopWindows()` would return empty.
+## 2. Daemon socket — Low latency, broken arg serialization
 
-### 2. Daemon socket (`cua-driver serve` + raw JSON-RPC) — FASTER BUT BUGGY
-
-The daemon runs as a background process listening on a Unix socket at `~/Library/Caches/cua-driver/cua-driver.sock`. It accepts JSON-RPC requests:
+`cua-driver serve` listens on `~/Library/Caches/cua-driver/cua-driver.sock`. Protocol:
 
 ```json
-{"jsonrpc":"2.0","method":"call","name":"get_window_state","arguments":{"pid":…}}
+{"jsonrpc":"2.0","method":"call","name":"<tool>","arguments":{...}}
 ```
 
-**What works:** Zero-argument tools (`list_apps`, `get_screen_size`, `list_tools`). These don't need `pid` in the arguments.
+Zero-arg tools work (~2ms). Tools requiring `pid` in `arguments` return `"Missing required integer field pid."` — the daemon's argument deserializer fails to parse `pid` from the JSON object, but `cua-driver call` (which uses the same socket internally) handles it correctly. Likely a difference in how the CLI's `DaemonClient` serializes args vs raw JSON-RPC framing — we didn't fully trace it because the CLI wrapper works.
 
-**What doesn't work:** Any tool requiring arguments (`get_window_state` with `pid`, `click` with `pid`+`x`+`y`, etc.). The daemon's argument deserialization rejects valid JSON with `"Missing required integer field pid."` — even though `pid` is present in the `arguments` object. The `cua-driver call` CLI wrapper handles this correctly (it serializes arguments differently), but the raw socket protocol does not.
+## 3. CLI subprocess — Works, ~200ms overhead
 
-**Latency:** ~1-5ms per call (no process spawn). If the serialization bug were fixed, this would be ideal.
+`cua-driver call <tool> '<json-args>' --raw --compact` is a thin CLI wrapper that:
+- Starts the daemon if not running
+- Serializes args correctly (the daemon parses them from this wrapper)
+- Returns MCP `CallToolResult` JSON (same format MCP stdio would use)
+- `--raw`: full MCP response with `content[]`, `structuredContent`, `isError`
+- `--compact`: minified JSON
 
-### 3. CLI subprocess (`cua-driver call`) — THE WORKING PATH
+The `--raw` flag is critical for programmatic use — without it the CLI unwraps `structuredContent` and prettifies, which is human-readable but harder to parse programmatically.
 
-Each tool call spawns `cua-driver call <name> '<json-args>' --raw --compact` as a subprocess. The CLI wrapper:
-
-1. Checks if the daemon is running; starts it if not
-2. Sends the request via the daemon socket (using its internal serialization, which works)
-3. Waits for the response and prints it as JSON
-4. Returns the exit code
-
-The `--raw` flag outputs the MCP `CallToolResult` directly — same format the stdio MCP mode would use. The `--compact` flag minifies the JSON.
-
-**Latency:** ~200-400ms per call (subprocess spawn). Acceptable for human-scale interactions (click, type, scroll — you wouldn't notice).
-
-**Why it works when the raw socket doesn't:** The CLI's `DaemonClient` class handles argument encoding in a way the raw daemon socket protocol expects. We never fully reverse-engineered the difference — but the CLI works, so we use it.
-
-## The App Bundle
+## Bundle
 
 ```
-CuaDriver.app/
-└── Contents/
-    ├── Info.plist        # Bundle identifier: com.trycua.driver
-    └── MacOS/
-        └── cua-driver    # x86_64 binary (copy, not symlink)
+~/Applications/CuaDriver.app/Contents/
+├── Info.plist    # com.trycua.driver, 14 keys
+└── MacOS/
+    └── cua-driver # x86_64 binary (copy), ad-hoc signed
 ```
 
-The bundle at `~/Applications/CuaDriver.app` wraps the x86_64 binary in a macOS app container with:
-- A valid `Info.plist` (CFBundleIdentifier, CFBundleName, etc.)
-- Ad-hoc code signature (`codesign -f -s - --deep`)
-- Installation in `~/Applications/` (no sudo needed)
+`/usr/local/bin/cua-driver` symlinks into this bundle. The daemon spawned by `cua-driver call` inherits the bundle identity, which satisfies Screen Recording TCC. This is why SOM captures return screenshots.
 
-**What the bundle fixes:** The MCP mode's TCC gate. When run from a bundle, `PermissionsGate.shared.ensureGranted()` can present a permission dialog to the user. When run as a standalone binary, this dialog never appears.
+Bundling does NOT fix the MCP deadlock — that's in AppKitBootstrap, not in TCC.
 
-**What the bundle does NOT fix:** The MCP concurrency deadlock. The deadlock is in `AppKitBootstrap`+`StdioTransport` interaction, not in the TCC path specifically.
-
-**Bundle relevance today:** The daemon auto-started by `cua-driver call` also gets the daemon process launched from the bundle (via the symlink), so screen captures from `get_window_state` work. This is why SOM mode returns images on our setup — the daemon has TCC grants because it's running from the bundle.
-
-## TCC Permission Matrix
+## TCC
 
 | Permission | Standalone binary | From bundle |
 |------------|-------------------|-------------|
-| Accessibility | ✅ Granted to Terminal.app, cascades | ✅ Same |
-| Screen Recording | ❌ Blocked (no bundle identity) | ✅ Granted to bundle, cascades to subprocesses |
-| Files/Folders | ✅ Via sandbox exemptions | ✅ Same |
+| Accessibility | ✅ (inherits from Terminal) | ✅ |
+| Screen Recording | ❌ (no bundle identity) | ✅ (bundle + ad-hoc sign) |
 
-## Latency breakdown
-
-| Operation | MCP stdio (arm64) | Daemon socket | CLI subprocess (Intel) |
-|-----------|-------------------|---------------|----------------------|
-| `list_apps` | ~50ms | ~2ms | ~200ms |
-| `get_window_state` (text) | ~100ms | ~5ms | ~300ms |
-| `get_window_state` (with image) | ~300ms | ~50ms | ~600ms |
-| `click(element)` | ~50ms | ~5ms | ~250ms |
-| `type("hello")` | ~100ms | ~10ms | ~300ms |
-| `screenshot` | ~200ms | ~40ms | ~500ms |
-
-## Future
-
-If the cua team:
-- **Fixes the concurrency deadlock** in `AppKitBootstrap` on Intel: the MCP stdio path becomes viable. The bundle still needed for TCC.
-- **Fixes the daemon pid serialization**: the raw socket path becomes the best option (~2ms latency).
-- **Builds and ships x86_64 binaries**: no more custom build process needed.
-
-Until then, the CLI subprocess path is the stable, working, recommended choice.
+AX-mode tools (click, type, scroll, drag, hotkey, focus_app, get_window_state text) need only Accessibility. SOM/vision mode needs both.
